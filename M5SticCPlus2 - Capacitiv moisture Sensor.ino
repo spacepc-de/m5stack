@@ -5,12 +5,9 @@
 # in which the dry and wet values are saved and later used to convert the soil moisture percentage.
 # After the measurement, WLAN is disconnected and the deep-sleep timer is activated.
 
-Translated with DeepL.com (free version)
-
 #include <M5StickCPlus2.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
-#include <esp_sleep.h>
 #include <Preferences.h>
 
 // WiFi-Zugangsdaten
@@ -27,7 +24,7 @@ const int soilSensorPin = 36;
 const int batteryPin    = 38;
 
 // Deep-Sleep-Zeit: 15 Minuten
-const long SLEEP_INTERVAL_US = 15L * 60L * 1000000L;
+const long SLEEP_INTERVAL_SEC = 15L * 60L;  // 15 Minuten in Sekunden
 
 // NVS-Speicher für Kalibrierung
 Preferences prefs;
@@ -40,9 +37,8 @@ int calWet = 700;   // Nass
 WiFiClient espClient;
 PubSubClient client(espClient);
 
-// Annahme: Der Button A liegt an GPIO 37 und geht beim Drücken auf LOW
-// -> Bitte anpassen, wenn dein Setup anders ist!
-#define BUTTON_GPIO 37
+// Button-Pin (M5StickCPlus2 interne Nutzung)
+#define BUTTON_GPIO M5.BtnA
 
 void setup_wifi();
 void sendSensorData();
@@ -58,44 +54,19 @@ void setup() {
   analogSetPinAttenuation(soilSensorPin, ADC_11db);
   analogSetPinAttenuation(batteryPin,    ADC_11db);
 
-  // Button-Pin auf INPUT_PULLUP
-  pinMode(BUTTON_GPIO, INPUT_PULLUP);
-
   // Kalibrierungswerte aus NVS laden
   prefs.begin("soilCal", false);
   calDry = prefs.getInt("calDry", 3200);
   calWet = prefs.getInt("calWet", 700);
   prefs.end();
 
-  // Aufwachgrund prüfen
-  esp_sleep_wakeup_cause_t wakeReason = esp_sleep_get_wakeup_cause();
-  if (wakeReason == ESP_SLEEP_WAKEUP_EXT0) {
-    Serial.println("Aufgewacht durch Button (EXT0). Teste langen Druck...");
-    bool calibrate = false;
-    unsigned long pressStart = 0;
-    unsigned long checkStart = millis();
-    while (millis() - checkStart < 3000) {
-      M5.update();
-      if (M5.BtnA.isPressed()) {
-        if (pressStart == 0) {
-          pressStart = millis();
-        }
-        if (millis() - pressStart > 2000) {
-          calibrate = true;
-          break;
-        }
-      } else {
-        pressStart = 0;  
-      }
-      delay(50);
-    }
+  Serial.println("Gerät gestartet.");
 
-    if (calibrate) {
-      Serial.println("Starte Kalibrierungsmodus.");
-      calibrateSensor();
-    } else {
-      Serial.println("Kein Kalibrierungsmodus, normaler Betrieb.");
-    }
+  // Aufwachgrund prüfen (M5.Power-Awake-Check wird automatisch verwaltet)
+  M5.update();
+  if (M5.BtnA.isPressed()) {
+    Serial.println("Aufwachgrund: Button A gedrückt. Starte Kalibrierung...");
+    calibrateSensor();
   } else {
     Serial.println("Aufwachgrund: Timer oder Kaltstart.");
   }
@@ -112,12 +83,8 @@ void setup() {
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
 
-  // Deep-Sleep vorbereiten
-  esp_sleep_enable_timer_wakeup(SLEEP_INTERVAL_US);
-  esp_sleep_enable_ext0_wakeup((gpio_num_t)BUTTON_GPIO, 0);
-
-  Serial.println("Gehe in Deep-Sleep...");
-  esp_deep_sleep_start();
+  Serial.println("Gehe in Sleep-Modus...");
+  M5.Power.timerSleep(SLEEP_INTERVAL_SEC);  // 15 Minuten Sleep
 }
 
 void loop() {
@@ -141,7 +108,7 @@ void setup_wifi() {
     Serial.println("\nWiFi verbunden!");
   } else {
     Serial.println("\nWiFi NICHT verbunden, gehe direkt schlafen...");
-    esp_deep_sleep_start();
+    M5.Power.timerSleep(SLEEP_INTERVAL_SEC);
   }
 }
 
@@ -159,7 +126,7 @@ void sendSensorData() {
   float batteryVoltage = rawBattery * (3.3f / 4095.0f) * 2.0f;
 
   // Batterie-Prozent (3,0 V = 0 %, 4,2 V = 100 %)
-  float battPercentF = (batteryVoltage - 3.0f) / (3.96f - 3.0f) * 100.0f;
+  float battPercentF = (batteryVoltage - 3.0f) / (4.2f - 3.0f) * 100.0f;
   if (battPercentF < 0)   battPercentF = 0;
   if (battPercentF > 100) battPercentF = 100;
   int batteryPercent = (int)battPercentF;
@@ -175,9 +142,7 @@ void sendSensorData() {
   // Wenn Spannung < 3.1V -> Sofort wieder schlafen, um Tiefentladung zu vermeiden
   if (batteryVoltage < 3.1) {
     Serial.println("Batterie unter 3.1V! -> Direkt in Deep-Sleep...");
-    esp_sleep_enable_timer_wakeup(SLEEP_INTERVAL_US);
-    esp_sleep_enable_ext0_wakeup((gpio_num_t)BUTTON_GPIO, 0);
-    esp_deep_sleep_start();
+    M5.Power.timerSleep(SLEEP_INTERVAL_SEC);
   }
 
   // JSON für MQTT
@@ -208,7 +173,6 @@ void calibrateSensor() {
   M5.Lcd.setCursor(0, 0);
   M5.Lcd.print("Kalibrierung\n\nSensor TROCKEN.\nDruecke kurz,\nwenn bereit.");
 
-  // Warte auf kurzen Druck
   while (true) {
     M5.update();
     if (M5.BtnA.wasPressed()) {
