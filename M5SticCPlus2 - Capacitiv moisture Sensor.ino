@@ -1,3 +1,12 @@
+# The program measures the soil moisture (via an analog input),
+# the battery voltage and sends the data to a server via MQTT. 
+# The device then switches to deep sleep. 
+# A long press of the button when waking up starts a calibration mode
+# in which the dry and wet values are saved and later used to convert the soil moisture percentage.
+# After the measurement, WLAN is disconnected and the deep-sleep timer is activated.
+
+Translated with DeepL.com (free version)
+
 #include <M5StickCPlus2.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
