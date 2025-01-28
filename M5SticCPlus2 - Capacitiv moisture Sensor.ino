@@ -4,11 +4,11 @@
 # A long press of the button when waking up starts a calibration mode
 # in which the dry and wet values are saved and later used to convert the soil moisture percentage.
 # After the measurement, WLAN is disconnected and the deep-sleep timer is activated.
-
 #include <M5StickCPlus2.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <Preferences.h>
+#include <algorithm>
 
 // WiFi-Zugangsdaten
 const char* ssid        = "Garfield";
@@ -19,195 +19,248 @@ const char* mqtt_server    = "mqtt.eu.thingsboard.cloud";
 const int   mqtt_port      = 1883;
 const char* mqtt_client_id = "66mi3z6exbg14z6su4hq";
 
-// Bodenfeuchtigkeitssensor & Batterie
-const int soilSensorPin = 36; 
+// Hardware-Pins
+const int soilSensorPin = 36;
 const int batteryPin    = 38;
 
-// Deep-Sleep-Zeit: 15 Minuten
-const long SLEEP_INTERVAL_SEC = 15L * 60L;  // 15 Minuten in Sekunden
+// Konfiguration
+const long SLEEP_INTERVAL_SEC  = 15L * 60L;  // 15 Minuten
+const int  STAT_SAMPLES        = 10;         // Messwerte für Filterung
+const int  CAL_HISTORY         = 24*7;       // 1 Woche Historiedaten
+const int  WATERING_THRESHOLD  = 15;         // Feuchtigkeitsanstieg für Gießerkennung
+const int  RESET_PRESS_TIME_MS = 3000;       // 3 Sekunden für Reset
+const int  DYNAMIC_RANGE_DAYS  = 3;          // Anpassungszeitraum
+const int  MIN_SENSOR_RANGE    = 500;        // Mindestbereich der Sensorwerte
 
-// NVS-Speicher für Kalibrierung
+// NVS-Speicher
 Preferences prefs;
 
-// Standard-Kalibrierungswerte (falls noch nicht gespeichert)
-int calDry = 3200;  // Trocken
-int calWet = 700;   // Nass
+// Kalibrierungsdaten
+int calDry = 3200;
+int calWet = 700;
+int learnedMin = 3200;
+int learnedMax = 700;
+int moistureHistory[CAL_HISTORY];
+int historyIndex = 0;
+unsigned long lastCalibrationUpdate = 0;
 
-// WiFi + MQTT
+// WiFi & MQTT
 WiFiClient espClient;
 PubSubClient client(espClient);
 
-// Button-Pin (M5StickCPlus2 interne Nutzung)
-#define BUTTON_GPIO M5.BtnA
-
 void setup_wifi();
 void sendSensorData();
-void calibrateSensor();
+void resetCalibration();
+void adaptiveCalibration(int currentValue);
 
 void setup() {
   M5.begin();
   Serial.begin(115200);
 
+  // Hardware-Initialisierung
   pinMode(soilSensorPin, INPUT);
-  pinMode(batteryPin,    INPUT);
+  pinMode(batteryPin, INPUT);
   analogReadResolution(12);
   analogSetPinAttenuation(soilSensorPin, ADC_11db);
-  analogSetPinAttenuation(batteryPin,    ADC_11db);
+  analogSetPinAttenuation(batteryPin, ADC_11db);
 
-  // Kalibrierungswerte aus NVS laden
-  prefs.begin("soilCal", false);
+  // Kalibrierungswerte laden
+  prefs.begin("soilCal", true);
   calDry = prefs.getInt("calDry", 3200);
   calWet = prefs.getInt("calWet", 700);
+  learnedMin = prefs.getInt("learnedMin", calDry);
+  learnedMax = prefs.getInt("learnedMax", calWet);
+  lastCalibrationUpdate = prefs.getULong("lastCal", 0);
   prefs.end();
 
-  Serial.println("Gerät gestartet.");
-
-  // Aufwachgrund prüfen (M5.Power-Awake-Check wird automatisch verwaltet)
-  M5.update();
-  if (M5.BtnA.isPressed()) {
-    Serial.println("Aufwachgrund: Button A gedrückt. Starte Kalibrierung...");
-    calibrateSensor();
-  } else {
-    Serial.println("Aufwachgrund: Timer oder Kaltstart.");
+  // Reset-Knopfcheck
+  bool resetPressed = false;
+  unsigned long startTime = millis();
+  while (millis() - startTime < RESET_PRESS_TIME_MS) {
+    M5.update();
+    if (!M5.BtnA.isPressed()) {
+      resetPressed = false;
+      break;
+    }
+    resetPressed = true;
+    delay(50);
   }
 
-  // WLAN
-  setup_wifi();
-  // MQTT
-  client.setServer(mqtt_server, mqtt_port);
+  if (resetPressed) {
+    Serial.println("Reset Kalibrierungswerte");
+    resetCalibration();
+  }
 
-  // Messung und Senden
+  // Messung durchführen
+  setup_wifi();
+  client.setServer(mqtt_server, mqtt_port);
   sendSensorData();
 
-  // WLAN aus
+  // Vor Sleep-Cleanup
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
-
-  Serial.println("Gehe in Sleep-Modus...");
-  M5.Power.timerSleep(SLEEP_INTERVAL_SEC);  // 15 Minuten Sleep
+  M5.Power.timerSleep(SLEEP_INTERVAL_SEC);
 }
 
-void loop() {
-  // Leer
-}
+void loop() {}
 
-/**
- * WLAN verbinden
- */
 void setup_wifi() {
   WiFi.begin(ssid, password);
-  Serial.println("Verbindungsaufbau WiFi...");
+  Serial.print("Verbindung zu WiFi...");
 
-  unsigned long startAttemptTime = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 10000) {
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
     delay(500);
     Serial.print(".");
   }
-
+  
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi verbunden!");
+    Serial.println("\nVerbunden! IP: " + WiFi.localIP().toString());
   } else {
-    Serial.println("\nWiFi NICHT verbunden, gehe direkt schlafen...");
+    Serial.println("\nFehlgeschlagen! Gehe schlafen...");
     M5.Power.timerSleep(SLEEP_INTERVAL_SEC);
   }
 }
 
-/**
- * Sensorwerte lesen und versenden
- */
 void sendSensorData() {
-  // Bodenfeuchte
-  int sensorValue = analogRead(soilSensorPin);
-  int moisturePercent = map(sensorValue, calDry, calWet, 0, 100);
+  // Statistische Filterung
+  int samples[STAT_SAMPLES];
+  for(int i=0; i<STAT_SAMPLES; i++) {
+    samples[i] = analogRead(soilSensorPin);
+    delay(5);
+  }
+  std::sort(samples, samples+STAT_SAMPLES);
+  int filteredValue = 0;
+  for(int i=2; i<STAT_SAMPLES-2; i++) filteredValue += samples[i];
+  filteredValue /= (STAT_SAMPLES-4);
+
+  // Adaptive Kalibrierung
+  adaptiveCalibration(filteredValue);
+
+  // Hybrid-Kalibrierung
+  int hybridDry = std::max(calDry, learnedMax);
+  int hybridWet = std::min(calWet, learnedMin);
+  
+  // Sicherheitsfall für widersprüchliche Kalibrierung
+  if(hybridDry <= hybridWet) {
+    int tempDry = std::max(calDry, learnedMax);
+    hybridDry = std::max(tempDry, 2500);  // Mindesttrockenwert
+    int tempWet = std::min(calWet, learnedMin);
+    hybridWet = std::min(tempWet, 2000);  // Maximalnasswert
+  }
+
+  // Feuchtigkeitsberechnung
+  int moisturePercent = map(filteredValue, hybridDry, hybridWet, 0, 100);
   moisturePercent = constrain(moisturePercent, 0, 100);
 
-  // Batterie-Spannung
+  // Gießerkennung
+  prefs.begin("soilCal", false);
+  int prevMoisture = prefs.getInt("prevMoisture", moisturePercent);
+  bool wateringDetected = abs(moisturePercent - prevMoisture) > WATERING_THRESHOLD;
+  prefs.putInt("prevMoisture", moisturePercent);
+  prefs.end();
+
+  // Batteriemessung
   int rawBattery = analogRead(batteryPin);
   float batteryVoltage = rawBattery * (3.3f / 4095.0f) * 2.0f;
+  batteryVoltage = constrain(batteryVoltage, 3.0f, 4.2f);
+  int batteryPercent = map(batteryVoltage * 100, 300, 420, 0, 100);
 
-  // Batterie-Prozent (3,0 V = 0 %, 4,2 V = 100 %)
-  float battPercentF = (batteryVoltage - 3.0f) / (4.2f - 3.0f) * 100.0f;
-  if (battPercentF < 0)   battPercentF = 0;
-  if (battPercentF > 100) battPercentF = 100;
-  int batteryPercent = (int)battPercentF;
-
-  Serial.print("Feuchtigkeit: ");
-  Serial.print(moisturePercent);
-  Serial.print("% | Batterie: ");
-  Serial.print(batteryVoltage);
-  Serial.print(" V (");
-  Serial.print(batteryPercent);
-  Serial.println("%)");
-
-  // Wenn Spannung < 3.1V -> Sofort wieder schlafen, um Tiefentladung zu vermeiden
+  // Low-Battery-Check
   if (batteryVoltage < 3.1) {
-    Serial.println("Batterie unter 3.1V! -> Direkt in Deep-Sleep...");
+    Serial.println("Kritische Batteriespannung!");
     M5.Power.timerSleep(SLEEP_INTERVAL_SEC);
   }
 
-  // JSON für MQTT
-  String payload = "{\"soil_moisture\":" + String(moisturePercent) +
-                   ",\"battery_voltage\":" + String(batteryVoltage, 2) +
-                   ",\"battery_percent\":" + String(batteryPercent) + "}";
+  // MQTT-Payload
+  String payload = String("{") +
+    "\"soil_moisture\":" + String(moisturePercent) + "," +
+    "\"soil_raw\":" + String(filteredValue) + "," +
+    "\"battery_voltage\":" + String(batteryVoltage, 2) + "," +
+    "\"battery_percent\":" + String(batteryPercent) + "," +
+    "\"cal_dry\":" + String(hybridDry) + "," +
+    "\"cal_wet\":" + String(hybridWet) + "," +
+    "\"watering_event\":" + String(wateringDetected ? "true" : "false") +
+  "}";
 
-  // Senden
+  // Daten senden
   if (client.connect(mqtt_client_id)) {
     client.publish("v1/devices/me/telemetry", payload.c_str());
     client.disconnect();
   }
+
+  Serial.println("Daten gesendet: " + payload);
 }
 
-/**
- * Kalibrierungsmodus:
- * 1) Display einschalten
- * 2) Trocken messen (kurzer Button-Druck)
- * 3) Nass messen (kurzer Button-Druck)
- * 4) Speichern in NVS
- * 5) Anzeige "Kalibriert"
- */
-void calibrateSensor() {
+void resetCalibration() {
   M5.Lcd.wakeup();
   M5.Lcd.setBrightness(200);
   M5.Lcd.fillScreen(BLACK);
   M5.Lcd.setTextSize(2);
   M5.Lcd.setCursor(0, 0);
-  M5.Lcd.print("Kalibrierung\n\nSensor TROCKEN.\nDruecke kurz,\nwenn bereit.");
+  M5.Lcd.print("Reset Kalibrierung...");
 
-  while (true) {
-    M5.update();
-    if (M5.BtnA.wasPressed()) {
-      break;
-    }
-    delay(50);
-  }
-  int dryVal = analogRead(soilSensorPin);
-
-  M5.Lcd.fillScreen(BLACK);
-  M5.Lcd.setCursor(0, 0);
-  M5.Lcd.print("Sensor NASS.\nDruecke kurz,\nwenn bereit.");
-
-  while (true) {
-    M5.update();
-    if (M5.BtnA.wasPressed()) {
-      break;
-    }
-    delay(50);
-  }
-  int wetVal = analogRead(soilSensorPin);
-
-  // Speichern
+  // Werte zurücksetzen
   prefs.begin("soilCal", false);
-  prefs.putInt("calDry", dryVal);
-  prefs.putInt("calWet", wetVal);
+  prefs.putInt("calDry", 3200);
+  prefs.putInt("calWet", 700);
+  prefs.putInt("learnedMin", 3200);
+  prefs.putInt("learnedMax", 700);
+  prefs.putULong("lastCal", 0);
   prefs.end();
 
-  calDry = dryVal;
-  calWet = wetVal;
+  // Variablen aktualisieren
+  calDry = 3200;
+  calWet = 700;
+  learnedMin = 3200;
+  learnedMax = 700;
+  lastCalibrationUpdate = 0;
 
   M5.Lcd.fillScreen(BLACK);
-  M5.Lcd.setCursor(0, 0);
-  M5.Lcd.println("Kalibriert!\n5 Sekunden warten...");
+  M5.Lcd.print("Reset erfolgt!\nStandardwerte:\nTrocken: 3200\nNass: 700");
   delay(5000);
-
   M5.Lcd.sleep();
+}
+
+void adaptiveCalibration(int currentValue) {
+  // Zeitbasierte Anpassung
+  unsigned long now = millis();
+  if (now - lastCalibrationUpdate > DYNAMIC_RANGE_DAYS * 86400000L) {
+    learnedMax = (learnedMax * 3 + currentValue) / 4;
+    learnedMin = (learnedMin * 3 + currentValue) / 4;
+    lastCalibrationUpdate = now;
+    
+    prefs.begin("soilCal", false);
+    prefs.putInt("learnedMin", learnedMin);
+    prefs.putInt("learnedMax", learnedMax);
+    prefs.putULong("lastCal", lastCalibrationUpdate);
+    prefs.end();
+  }
+
+  // Sofortige Anpassung bei Extremwerten
+  if (currentValue > learnedMax) {
+    learnedMax = currentValue;
+    prefs.begin("soilCal", false);
+    prefs.putInt("learnedMax", learnedMax);
+    prefs.end();
+  }
+  
+  if (currentValue < learnedMin) {
+    learnedMin = currentValue;
+    prefs.begin("soilCal", false);
+    prefs.putInt("learnedMin", learnedMin);
+    prefs.end();
+  }
+
+  // Bereichsvalidierung
+  if (learnedMax - learnedMin < MIN_SENSOR_RANGE) {
+    int midPoint = (learnedMax + learnedMin) / 2;
+    learnedMax = midPoint + MIN_SENSOR_RANGE/2;
+    learnedMin = midPoint - MIN_SENSOR_RANGE/2;
+    
+    prefs.begin("soilCal", false);
+    prefs.putInt("learnedMin", learnedMin);
+    prefs.putInt("learnedMax", learnedMax);
+    prefs.end();
+  }
 }
